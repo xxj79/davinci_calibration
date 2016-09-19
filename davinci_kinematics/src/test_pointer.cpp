@@ -1,22 +1,28 @@
-#include<ros/ros.h> 
-#include<geometry_msgs/Point.h> 
+#include <ros/ros.h> 
+#include <geometry_msgs/Point.h> 
 #include <davinci_kinematics/davinci_kinematics.h>
 #include <actionlib/client/simple_action_client.h>
 #include <actionlib/client/terminal_state.h>
-#include<davinci_traj_streamer/trajAction.h>
+#include <davinci_traj_streamer/trajAction.h>
+//#include <gsl/gsl_matrix.h>
+#include <iomanip>
+//#include <ginac/ginac.h>
 
 bool g_got_new_pose = false;
 int g_count = 0;
 int iter = 0;
+double pos_in_cam[3][10];
 
 Eigen::Vector3d g_des_point;
+Eigen::Vector3d g_point;
 
 Davinci_fwd_solver g_davinci_fwd_solver; //instantiate a forward-kinematics solver    
 Davinci_IK_solver g_ik_solver;
 Eigen::Affine3d g_des_gripper_affine1, g_des_gripper_affine2;
-Eigen::Affine3d g_affine_lcamera_to_psm_one;
-Eigen::Affine3d g_des_gripper1_wrt_base; 
-Vectorq7x1 g_q_vec1_start, g_q_vec1_goal, g_q_vec2_start, g_q_vec2_goal;
+Eigen::Affine3d g_affine_lcamera_to_psm_one, g_affine_camera_to_one_tool_tip;
+Eigen::Affine3d g_des_gripper1_wrt_base, g_real_gripper1_wrt_base; 
+Vectorq7x1 g_q_vec1_start, g_q_vec1_goal, g_q_vec2_start, g_q_vec2_goal, g_q_real;
+Matrix base, camera;
 
 trajectory_msgs::JointTrajectory g_des_trajectory; // an empty trajectory 
 trajectory_msgs::JointTrajectoryPoint g_trajectory_point1, g_trajectory_point2;
@@ -62,6 +68,15 @@ void move_tip(){
         //iter+=1;
         ros::Duration(0.5).sleep();
 }
+
+void inJointCallback(const sensor_msgs::JointState& jt_msg){
+    g_q_real(0) = jt_msg.position[0]; 
+    g_q_real(1) = jt_msg.position[1];
+    g_q_real(2) = jt_msg.position[7];
+    g_q_real(3) = jt_msg.position[8];
+    g_q_real(4) = jt_msg.position[10];
+    g_q_real(5) = jt_msg.position[11];
+} 
 
 void inPointCallback(const geometry_msgs::Point& pt_msg) {
     Eigen::Affine3d des_gripper1_wrt_base;
@@ -239,10 +254,59 @@ int do_inits() {
 int main(int argc, char **argv) {
     ros::init(argc, argv, "test_pointer");
     ros::NodeHandle n;
+/*
+    {gsl_matrix * a = gsl_matrix_alloc( 2, 2);
+    gsl_matrix * b = gsl_matrix_alloc( 2, 2);
 
+    gsl_matrix_set_zero(a);
+    gsl_matrix_set_zero(b);
 
+    for(int i=0; i<=1;i++)
+    {
+        for(int j=0; j<= 1 ; j++)
+        {
+            gsl_matrix_set(a,i,j,1.0);
+            gsl_matrix_set(b,i,j,1.0);
+        }
+    }
+
+    gsl_matrix_add(a, b);
+    cout << "matrix a: \n";
+    for(int i=0; i<=1;i++)
+    {
+        for(int j=0; j<= 1 ; j++)
+        {
+            cout << setw(3) << gsl_matrix_get(a,i,j);
+        }
+        cout << "\n";
+    }
+    cout << "matrix b: \n";
+    for(int i=0; i<=1;i++)
+    {
+        for(int j=0; j<= 1 ; j++)
+        {
+            cout << setw(3) << gsl_matrix_get(b,i,j);
+        }
+        cout << "\n";
+    }
+
+    gsl_matrix_free(a);
+    gsl_matrix_free(b);
+}
+*/
+  /*  
+    symbol x("x"), y("y");
+    ex poly;
+    
+    for (int i=0; i<3; ++i)
+    poly += factorial(i+16)*pow(x,i)*pow(y,2-i);
+    
+    cout << poly << endl;
+
+*/
     //ros::Subscriber thePoint = n.subscribe("/thePoint", 1, inPointCallback);
-    //could separately subscribe to the normal topic, "/the_plane_normal"
+    //could separately supobscribe to the normal topic, "/the_plane_normal"
+    ros::Subscriber theJoints = n.subscribe("/davinci/joint_states", 1, inJointCallback);
     if (do_inits()!=0) return 1; //poor-man's constructor       
     
      actionlib::SimpleActionClient<davinci_traj_streamer::trajAction> g_action_client("trajActionServer", true);
@@ -288,15 +352,61 @@ int main(int argc, char **argv) {
                 ROS_INFO("finished before timeout");
             }
             ros::Duration(3).sleep();
-        }
-    }        
-        
+
+            //Eigen::Affine3d Davinci_fwd_solver::fwd_kin_solve(const Vectorq7x1& q_vec)
+            g_real_gripper1_wrt_base = g_davinci_fwd_solver.fwd_kin_solve(g_q_real); 
+            cout<< "the "<< i+1 <<"th point's coord wrt base:"<< g_real_gripper1_wrt_base.translation().transpose() <<endl;
+            for (int j=0;j<3;j++){
+                base(i,j)=g_real_gripper1_wrt_base.translation().transpose()(j);
+            }
+            //base(i)<< g_real_gripper1_wrt_base.translation().transpose();
+
+            //get the transform to know coordinates in camear frame    
+            ROS_INFO("getting transforms from camera to tip");
+            tf::TransformListener tfListener;
+            tf::StampedTransform tfResult;
+            bool tferr = true;
+            int ntries = 0;
+            ROS_INFO("waiting for tf between base and right_hand...");
+            while (tferr) {
+                if (ntries > 5) break; //give up and accept default after this many tries
+                tferr= false;
+                try {
+            //The direction of the transform returned will be from the target_frame to the source_frame. 
+            //Which if applied to data, will transform data in the source_frame into the target_frame. See tf/CoordinateFrameConventions#Transform_Direction
+                    tfListener.lookupTransform("camera", "one_tool_tip_link", ros::Time(0), tfResult);
+            //tfListener.lookupTransform("left_camera_optical_frame", "two_psm_base_link", ros::Time(0), tfResult_two);
+                } catch (tf::TransformException &exception) {
+                    ROS_WARN("%s", exception.what());
+                    tferr = true;
+                ros::Duration(0.5).sleep(); // sleep for half a second
+                    ros::spinOnce();
+                    ntries++;
+                }
+            }
+            if(!tferr){
+                ROS_INFO("tf is good");
+            }
+            g_affine_camera_to_one_tool_tip = transformTFToEigen(tfResult);
+            //g_point = g_affine_camera_to_one_tool_tip.translation();
+            //pos_in_cam[0][i] = g_point(0);
+            //pos_in_cam[1][i] = g_point(1);
+            //pos_in_cam[2][i] = g_point(2);
+            cout<< "the "<< i+1 <<"th point's coord wrt camera:" << g_affine_camera_to_one_tool_tip.translation().transpose() <<endl; 
+            for (int j=0;j<3;j++){
+                camera(i,j)= g_affine_camera_to_one_tool_tip.translation().transpose()(j);
+            }
+            //camera(i)<< g_affine_camera_to_one_tool_tip.translation().transpose();
+            //for(int j=0; j<2; j++){
+            //    cout << pos_in_cam[j][i] << endl;
+            //}
+            //cout<< "the"<< i+1 <<"th point's coord wrt camera:" << pos_in_cam[][i] << endl;        
 
 
-    //while (ros::ok()) {
-      //  ros::spinOnce();
-        //if (g_got_new_pose) {
-          //  ROS_INFO("sending new goal");
+            //while (ros::ok()) {
+            //  ros::spinOnce();
+            //if (g_got_new_pose) {
+            //  ROS_INFO("sending new goal");
             //g_got_new_pose = false;
                // stuff a goal message:
               //  g_count++;
@@ -305,14 +415,19 @@ int main(int argc, char **argv) {
             //g_action_client.sendGoal(g_goal, &doneCb);
             //g_action_client.sendGoal(g_goal);
             //bool finished_before_timeout = g_action_client.waitForResult(ros::Duration(5.0));
-//            if (!finished_before_timeout) {
-  //              ROS_WARN("giving up waiting on result for goal number %d", g_count);
- //               return 0;
- //           } else {
- //               ROS_INFO("finished before timeout");
-  //          }
-  //          ros::Duration(0.5).sleep();
- //      }
-  //  }
+            //            if (!finished_before_timeout) {
+            //              ROS_WARN("giving up waiting on result for goal number %d", g_count);
+            //               return 0;
+            //           } else {
+            //               ROS_INFO("finished before timeout");
+             //          }
+            //          ros::Duration(0.5).sleep();
+        }
+    }
+    cout<< endl;
+    cout<< "base dataset:"<< endl;
+    cout<< base << endl << endl;
+    cout<< "camera dataset:" << endl; 
+    cout<< camera << endl << endl;
     return 0; // should never get here, unless roscore dies 
 }
